@@ -12,15 +12,17 @@ const PINNED_SHA256_X86_64: &str =
 const PINNED_SHA256_AARCH64: &str =
     "65a39256b9dd741e20c3a3fe5055cb38e5159049b5ede2015604951521000a04";
 
-const HELLO_KERNEL_URL: &str = "https://s3.amazonaws.com/spec.ccfc.min/img/hello/kernel/hello-vmlinux.bin";
-const HELLO_ROOTFS_URL: &str = "https://s3.amazonaws.com/spec.ccfc.min/img/hello/fsfiles/hello-rootfs.ext4";
+const HELLO_KERNEL_URL: &str =
+    "https://s3.amazonaws.com/spec.ccfc.min/img/hello/kernel/hello-vmlinux.bin";
+const HELLO_ROOTFS_URL: &str =
+    "https://s3.amazonaws.com/spec.ccfc.min/img/hello/fsfiles/hello-rootfs.ext4";
 
 const HELLO_KERNEL_SHA256: &str =
     "882fa465c43ab7d92e31bd4167da3ad6a82cb9230f9b0016176df597c6014cef";
 const HELLO_ROOTFS_SHA256: &str =
     "786f0612582cadcee4c8ad46e30e4cc93dff9a3c0b4ede3f3c597b4c241dd547";
 
-pub async fn doctor() -> Result<bool> {
+pub async fn doctor() -> Result<()> {
     println!("peer-ci doctor");
 
     let mut required_failures = 0usize;
@@ -58,10 +60,7 @@ pub async fn doctor() -> Result<bool> {
             a
         }
         Err(_) => {
-            warn(
-                "arch",
-                &format!("{arch} (expected x86_64 or aarch64)"),
-            );
+            warn("arch", &format!("{arch} (expected x86_64 or aarch64)"));
             arch
         }
     };
@@ -103,10 +102,10 @@ pub async fn doctor() -> Result<bool> {
 
     if required_failures == 0 {
         println!("Result: OK");
-        Ok(true)
+        Ok(())
     } else {
         eprintln!("Result: FAILED ({required_failures} required check(s) failed)");
-        Ok(false)
+        bail!("doctor failed")
     }
 }
 
@@ -383,7 +382,9 @@ async fn check_binary(bin: &str, cache_dir: Option<&Path>, arch: &str) -> usize 
                 let candidate = version_dir.join(arch).join(bin);
                 if fs::try_exists(&candidate).await.unwrap_or(false)
                     && is_executable(&candidate)
-                    && !found.iter().any(|(_, p): &(String, PathBuf)| p == &candidate)
+                    && !found
+                        .iter()
+                        .any(|(_, p): &(String, PathBuf)| p == &candidate)
                 {
                     found.push(("cache".to_string(), candidate));
                 }

@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 pub fn normalize_arch(arch: &str) -> Result<&'static str> {
     match arch {

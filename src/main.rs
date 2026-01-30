@@ -5,9 +5,10 @@ mod platform;
 use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Command};
+use std::process::ExitCode;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -16,11 +17,21 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Doctor => {
-            let ok = firecracker::doctor().await?;
-            if !ok {
-                std::process::exit(1);
+            if firecracker::doctor().await.is_err() {
+                Ok(ExitCode::FAILURE)
+            } else {
+                Ok(ExitCode::SUCCESS)
             }
         }
+        cmd => {
+            run_command(cmd).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+async fn run_command(cmd: Command) -> Result<()> {
+    match cmd {
         Command::InstallFirecracker {
             version,
             sha256,
@@ -29,7 +40,9 @@ async fn main() -> Result<()> {
             no_jailer,
             no_guest,
         } => {
-            let fc = firecracker::install_firecracker(version, sha256, arch.clone(), force, !no_jailer).await?;
+            let fc =
+                firecracker::install_firecracker(version, sha256, arch.clone(), force, !no_jailer)
+                    .await?;
             println!("{}", fc.firecracker.display());
             if let Some(jailer) = fc.jailer {
                 println!("{}", jailer.display());
@@ -44,6 +57,7 @@ async fn main() -> Result<()> {
         Command::Run { cmd } => {
             firecracker::run_task(cmd).await?;
         }
+        Command::Doctor => unreachable!(),
     }
 
     Ok(())
