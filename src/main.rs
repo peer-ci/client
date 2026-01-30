@@ -1,5 +1,6 @@
 mod cli;
 mod firecracker;
+mod http_unix;
 mod platform;
 
 use anyhow::Result;

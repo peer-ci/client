@@ -39,9 +39,9 @@ pub enum Command {
         no_guest: bool,
     },
 
-    /// Run a task inside a Firecracker microVM (stub).
+    /// Boot the hello guest in a Firecracker microVM and stream the serial console.
     Run {
-        /// Shell command to execute inside the VM.
+        /// Shell command to execute inside the VM (currently unused; boots hello guest only).
         #[arg(long)]
         cmd: String,
     },

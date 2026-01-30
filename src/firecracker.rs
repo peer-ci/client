@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 
+use crate::http_unix;
 use crate::platform;
 
 const PINNED_VERSION: &str = "1.14.1";
@@ -274,9 +275,260 @@ pub async fn install_guest_hello(arch: Option<String>, force: bool) -> Result<In
 }
 
 pub async fn run_task(cmd: String) -> Result<()> {
-    // Stub: later this will spin up a microVM and run the command inside it.
-    tracing::info!(%cmd, "run requested");
-    Ok(())
+    // Currently boots the cached hello guest and streams the serial console.
+    // `cmd` is accepted for CLI compatibility but not used yet.
+    let _ = cmd;
+
+    // Fail fast with a clear message (we run unprivileged).
+    match fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").await {
+        Ok(_) => {}
+        Err(e) => {
+            bail!("/dev/kvm not accessible ({e}); try `peer-ci doctor` and ensure your user has permission (often via the kvm group)");
+        }
+    }
+
+    let arch = platform::normalize_arch(platform::current_arch())
+        .unwrap_or_else(|_| platform::current_arch());
+    let cache_dir = cache_dir()?;
+
+    let firecracker = find_cached_bin(&cache_dir, arch, "firecracker")
+        .await
+        .ok_or_else(|| anyhow!("firecracker not installed; run `peer-ci install-firecracker`"))?;
+    let jailer = find_cached_bin(&cache_dir, arch, "jailer")
+        .await
+        .ok_or_else(|| anyhow!("jailer not installed; run `peer-ci install-firecracker`"))?;
+
+    let guest_dir = hello_guest_dir(&cache_dir, arch);
+    let kernel_src = guest_dir.join("hello-vmlinux.bin");
+    let rootfs_src = guest_dir.join("hello-rootfs.ext4");
+
+    if !fs::try_exists(&kernel_src).await.unwrap_or(false)
+        || !fs::try_exists(&rootfs_src).await.unwrap_or(false)
+    {
+        bail!("hello guest not installed; run `peer-ci install-firecracker` (without --no-guest)");
+    }
+
+    let id = format!("{}-{}", std::process::id(), now_millis());
+    let chroot_base = default_chroot_base();
+
+    let jail_root = chroot_base.join(&id).join("root");
+    let _ = fs::remove_dir_all(chroot_base.join(&id)).await;
+    fs::create_dir_all(&jail_root).await.with_context(|| {
+        format!("create jail root: {}", jail_root.display())
+    })?;
+
+    let kernel_jail = jail_root.join("hello-vmlinux.bin");
+    let rootfs_jail = jail_root.join("hello-rootfs.ext4");
+
+    link_or_copy(&kernel_src, &kernel_jail).await?;
+    link_or_copy(&rootfs_src, &rootfs_jail).await?;
+
+    // Firecracker socket will be created inside chroot at /run/firecracker.socket.
+    let run_dir = jail_root.join("run");
+    fs::create_dir_all(&run_dir).await?;
+    let api_sock_in_jail = "/run/firecracker.socket";
+    let api_sock_host = run_dir.join("firecracker.socket");
+
+    let uid = nix_uid();
+    let gid = nix_gid();
+
+    let mut child = tokio::process::Command::new(&jailer)
+        .arg("--id")
+        .arg(&id)
+        .arg("--exec-file")
+        .arg(&firecracker)
+        .arg("--uid")
+        .arg(uid.to_string())
+        .arg("--gid")
+        .arg(gid.to_string())
+        .arg("--chroot-base-dir")
+        .arg(&chroot_base)
+        .arg("--")
+        .arg("--api-sock")
+        .arg(api_sock_in_jail)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| "spawn jailer")?;
+
+    // Pump jailer/firecracker output to our stdout/stderr.
+    if let Some(out) = child.stdout.take() {
+        tokio::spawn(async move {
+            let mut r = tokio::io::BufReader::new(out);
+            let mut w = tokio::io::stdout();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut r = tokio::io::BufReader::new(err);
+            let mut w = tokio::io::stderr();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+    }
+
+    let jailer_pid = child.id().unwrap_or(0) as i32;
+    let cleanup_dir = chroot_base.join(&id);
+
+    let cleanup = |pid: i32, dir: PathBuf| async move {
+        if pid != 0 {
+            let _ = tokio::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .status()
+                .await;
+        }
+        let _ = fs::remove_dir_all(&dir).await;
+    };
+
+    // Wait for API socket (unprivileged path/permissions issues will surface here).
+    if let Err(e) = wait_for_socket_or_exit(&api_sock_host, &mut child).await {
+        cleanup(jailer_pid, cleanup_dir.clone()).await;
+        return Err(e);
+    }
+
+    // Configure VM via Firecracker API.
+    if let Err(e) = async {
+        http_unix::put_json(
+            &api_sock_host,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256,"ht_enabled":false}"#,
+        )
+        .await?;
+        http_unix::put_json(
+            &api_sock_host,
+            "/boot-source",
+            "{\"kernel_image_path\":\"/hello-vmlinux.bin\",\"boot_args\":\"console=ttyS0 reboot=k panic=1\"}",
+        )
+        .await?;
+        http_unix::put_json(
+            &api_sock_host,
+            "/drives/rootfs",
+            "{\"drive_id\":\"rootfs\",\"path_on_host\":\"/hello-rootfs.ext4\",\"is_root_device\":true,\"is_read_only\":false}",
+        )
+        .await?;
+        http_unix::put_json(&api_sock_host, "/actions", r#"{"action_type":"InstanceStart"}"#).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await
+    {
+        cleanup(jailer_pid, cleanup_dir.clone()).await;
+        return Err(e);
+    }
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            cleanup(jailer_pid, cleanup_dir).await;
+            Ok(())
+        }
+        status = child.wait() => {
+            let _ = fs::remove_dir_all(&cleanup_dir).await;
+            let status = status?;
+            if status.success() {
+                Ok(())
+            } else {
+                bail!("jailer exited with status: {status}")
+            }
+        }
+    }
+}
+
+fn default_chroot_base() -> PathBuf {
+    if let Ok(v) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(v).join("peer-ci").join("jailer");
+    }
+    PathBuf::from("/tmp").join("peer-ci").join("jailer")
+}
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn getuid() -> u32;
+    fn getgid() -> u32;
+}
+
+fn nix_uid() -> u32 {
+    #[cfg(unix)]
+    unsafe {
+        getuid()
+    }
+
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn nix_gid() -> u32 {
+    #[cfg(unix)]
+    unsafe {
+        getgid()
+    }
+
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+async fn link_or_copy(src: &Path, dest: &Path) -> Result<()> {
+    let _ = fs::remove_file(dest).await;
+    match fs::hard_link(src, dest).await {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            fs::copy(src, dest)
+                .await
+                .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
+            Ok(())
+        }
+    }
+}
+
+async fn find_cached_bin(cache_dir: &Path, arch: &str, bin: &str) -> Option<PathBuf> {
+    let root = cache_dir.join("firecracker");
+    let mut best: Option<(String, PathBuf)> = None;
+
+    let mut versions = fs::read_dir(&root).await.ok()?;
+    while let Ok(Some(entry)) = versions.next_entry().await {
+        let ver = entry.file_name().to_string_lossy().to_string();
+        let candidate = entry.path().join(arch).join(bin);
+        if fs::try_exists(&candidate).await.unwrap_or(false) && is_executable(&candidate) {
+            match &best {
+                Some((best_ver, _)) if best_ver >= &ver => {}
+                _ => best = Some((ver, candidate)),
+            }
+        }
+    }
+
+    best.map(|(_, p)| p)
+}
+
+async fn wait_for_socket_or_exit(sock: &Path, child: &mut tokio::process::Child) -> Result<()> {
+    use tokio::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if fs::try_exists(sock).await.unwrap_or(false) {
+            return Ok(());
+        }
+
+        if let Some(status) = child.try_wait()? {
+            bail!("jailer exited before creating API socket: {status}");
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    bail!(
+        "Firecracker API socket not created at {}. This is often a permissions issue (jailer/chroot or /dev/kvm). Try `peer-ci doctor` and ensure you can access /dev/kvm; also ensure the jailer binary can run unprivileged.",
+        sock.display()
+    )
 }
 
 fn cache_dir() -> Result<PathBuf> {
