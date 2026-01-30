@@ -24,9 +24,14 @@ async fn main() -> Result<()> {
             sha256,
             arch,
             force,
+            no_jailer,
         } => {
-            let path = firecracker::install_firecracker(version, sha256, arch, force).await?;
-            println!("{}", path.display());
+            let paths =
+                firecracker::install_firecracker(version, sha256, arch, force, !no_jailer).await?;
+            println!("{}", paths.firecracker.display());
+            if let Some(jailer) = paths.jailer {
+                println!("{}", jailer.display());
+            }
         }
         Command::Run { cmd } => {
             firecracker::run_task(cmd).await?;

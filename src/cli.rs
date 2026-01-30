@@ -12,7 +12,7 @@ pub enum Command {
     /// Print environment and exit.
     Doctor,
 
-    /// Download and cache a pinned Firecracker binary.
+    /// Download and cache Firecracker (and jailer).
     InstallFirecracker {
         /// Firecracker version (e.g. 1.14.1 or v1.14.1)
         #[arg(long, default_value = "1.14.1")]
@@ -29,6 +29,10 @@ pub enum Command {
         /// Re-download even if already cached.
         #[arg(long)]
         force: bool,
+
+        /// Do not install jailer (not recommended).
+        #[arg(long)]
+        no_jailer: bool,
     },
 
     /// Run a task inside a Firecracker microVM (stub).

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -7,12 +7,19 @@ use tokio::io::AsyncReadExt;
 use crate::platform;
 
 const PINNED_VERSION: &str = "1.14.1";
-const PINNED_SHA256_X86_64: &str = "ea66dc1fbdb2473bbb95a1e822ae7884cd575a891a8f801258723258d36b7c7c";
-const PINNED_SHA256_AARCH64: &str = "65a39256b9dd741e20c3a3fe5055cb38e5159049b5ede2015604951521000a04";
+const PINNED_SHA256_X86_64: &str =
+    "ea66dc1fbdb2473bbb95a1e822ae7884cd575a891a8f801258723258d36b7c7c";
+const PINNED_SHA256_AARCH64: &str =
+    "65a39256b9dd741e20c3a3fe5055cb38e5159049b5ede2015604951521000a04";
 
 pub async fn doctor() -> Result<()> {
     // Stub: later we can validate KVM availability, Firecracker binary, API socket perms, etc.
     Ok(())
+}
+
+pub struct InstalledBinaries {
+    pub firecracker: PathBuf,
+    pub jailer: Option<PathBuf>,
 }
 
 pub async fn install_firecracker(
@@ -20,10 +27,12 @@ pub async fn install_firecracker(
     sha256: Option<String>,
     arch: Option<String>,
     force: bool,
-) -> Result<PathBuf> {
+    install_jailer: bool,
+) -> Result<InstalledBinaries> {
     let version = version.strip_prefix('v').unwrap_or(&version).to_string();
 
-    let resolved_arch = platform::normalize_arch(arch.as_deref().unwrap_or(platform::current_arch()))?.to_string();
+    let resolved_arch =
+        platform::normalize_arch(arch.as_deref().unwrap_or(platform::current_arch()))?.to_string();
 
     let expected_sha256 = if version == PINNED_VERSION {
         match resolved_arch.as_str() {
@@ -40,10 +49,21 @@ pub async fn install_firecracker(
         .join("firecracker")
         .join(format!("v{version}"))
         .join(&resolved_arch);
-    let bin_path = install_dir.join("firecracker");
+    let firecracker_path = install_dir.join("firecracker");
+    let jailer_path = install_dir.join("jailer");
 
-    if !force && fs::try_exists(&bin_path).await.unwrap_or(false) {
-        return Ok(bin_path);
+    let firecracker_exists = fs::try_exists(&firecracker_path).await.unwrap_or(false);
+    let jailer_exists = fs::try_exists(&jailer_path).await.unwrap_or(false);
+
+    if !force && firecracker_exists && (!install_jailer || jailer_exists) {
+        return Ok(InstalledBinaries {
+            firecracker: firecracker_path,
+            jailer: if install_jailer {
+                Some(jailer_path)
+            } else {
+                None
+            },
+        });
     }
 
     fs::create_dir_all(&install_dir)
@@ -59,10 +79,28 @@ pub async fn install_firecracker(
 
     verify_sha256(&tmp_tgz, &expected_sha256).await?;
 
-    extract_firecracker_from_tgz(&tmp_tgz, &bin_path).await?;
+    extract_binary_from_tgz(
+        &tmp_tgz,
+        &firecracker_path,
+        "firecracker",
+        &version,
+        &resolved_arch,
+    )
+    .await?;
+
+    let jailer = if install_jailer {
+        extract_binary_from_tgz(&tmp_tgz, &jailer_path, "jailer", &version, &resolved_arch).await?;
+        Some(jailer_path)
+    } else {
+        None
+    };
+
     let _ = fs::remove_file(&tmp_tgz).await;
 
-    Ok(bin_path)
+    Ok(InstalledBinaries {
+        firecracker: firecracker_path,
+        jailer,
+    })
 }
 
 pub async fn run_task(cmd: String) -> Result<()> {
@@ -79,7 +117,6 @@ fn cache_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set (needed to resolve cache dir)")?;
     Ok(PathBuf::from(home).join(".cache").join("peer-ci"))
 }
-
 
 async fn download_to_path(url: &str, dest: &Path) -> Result<()> {
     // We intentionally use `curl` to avoid adding a full HTTP client dependency for now.
@@ -124,26 +161,69 @@ async fn verify_sha256(path: &Path, expected_hex: &str) -> Result<()> {
     Ok(())
 }
 
-async fn extract_firecracker_from_tgz(tgz: &Path, out_bin: &Path) -> Result<()> {
-    // Release tgz contains a top-level `release-vX.Y.Z-{arch}/firecracker`.
-    // We use `tar` for extraction to keep deps minimal.
+async fn extract_binary_from_tgz(
+    tgz: &Path,
+    out_bin: &Path,
+    binary: &str,
+    version: &str,
+    arch: &str,
+) -> Result<()> {
+    // Release tgz contains a top-level `release-vX.Y.Z-{arch}/{binary}-vX.Y.Z-{arch}`.
+    // We extract into a temp dir and then rename to a stable name.
     let out_dir = out_bin
         .parent()
         .ok_or_else(|| anyhow!("invalid output path"))?;
 
+    let tmp_dir = out_dir.join(format!(".tmp-extract-{binary}"));
+    let _ = fs::remove_dir_all(&tmp_dir).await;
+    fs::create_dir_all(&tmp_dir).await?;
+
+    let wildcard = format!("*/{binary}*");
+
     let status = tokio::process::Command::new("tar")
         .args(["-xzf"])
         .arg(tgz)
-        .args(["--wildcards", "--no-anchored", "*/firecracker", "--strip-components=1"])
+        .args(["--wildcards", "--no-anchored"])
+        .arg(&wildcard)
+        .arg("--strip-components=1")
         .arg("-C")
-        .arg(out_dir)
+        .arg(&tmp_dir)
         .status()
         .await
         .context("failed to spawn tar")?;
 
     if !status.success() {
-        bail!("failed to extract firecracker from {}", tgz.display());
+        bail!("failed to extract {binary} from {}", tgz.display());
     }
+
+    let expected = format!("{binary}-v{version}-{arch}");
+
+    let mut entries = fs::read_dir(&tmp_dir).await?;
+    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if entry.metadata().await.map(|m| m.is_file()).unwrap_or(false) && name.starts_with(binary)
+        {
+            candidates.push((name, entry.path()));
+        }
+    }
+
+    let src = if let Some((_, p)) = candidates.iter().find(|(n, _)| n == &expected) {
+        p.clone()
+    } else if let Some((_, p)) = candidates.iter().find(|(n, _)| n == binary) {
+        p.clone()
+    } else if candidates.len() == 1 {
+        candidates[0].1.clone()
+    } else {
+        bail!(
+            "unexpected extracted files for {binary}: {:?}",
+            candidates.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+    };
+
+    let _ = fs::remove_file(out_bin).await;
+    fs::rename(&src, out_bin).await?;
+    let _ = fs::remove_dir_all(&tmp_dir).await;
 
     // Ensure executable bit.
     #[cfg(unix)]
