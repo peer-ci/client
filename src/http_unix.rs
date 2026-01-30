@@ -10,7 +10,7 @@ pub async fn put_json(sock: &Path, path: &str, json_body: &str) -> Result<u16> {
 
     let req = format!(
         "PUT {path} HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-        json_body.as_bytes().len(),
+        json_body.len(),
         json_body
     );
 
@@ -21,9 +21,7 @@ pub async fn put_json(sock: &Path, path: &str, json_body: &str) -> Result<u16> {
     stream.read_to_end(&mut buf).await?;
 
     let raw = String::from_utf8_lossy(&buf);
-    let (head, body) = raw
-        .split_once("\r\n\r\n")
-        .unwrap_or((raw.as_ref(), ""));
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_ref(), ""));
 
     let status = head
         .lines()
@@ -33,7 +31,10 @@ pub async fn put_json(sock: &Path, path: &str, json_body: &str) -> Result<u16> {
         .unwrap_or(0);
 
     if !(200..300).contains(&status) {
-        bail!("http PUT {path} failed: status {status}; response: {}", raw.trim());
+        bail!(
+            "http PUT {path} failed: status {status}; response: {}",
+            raw.trim()
+        );
     }
 
     let _ = body;

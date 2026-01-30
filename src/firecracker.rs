@@ -219,20 +219,22 @@ pub async fn install_guest_hello(arch: Option<String>, force: bool) -> Result<In
     let mut kernel_exists = fs::try_exists(&kernel_path).await.unwrap_or(false);
     let mut rootfs_exists = fs::try_exists(&rootfs_path).await.unwrap_or(false);
 
-    if !force && kernel_exists {
-        if let Err(e) = verify_sha256(&kernel_path, HELLO_KERNEL_SHA256).await {
-            tracing::warn!(error = %e, "cached hello kernel sha256 mismatch; re-downloading");
-            kernel_exists = false;
-            let _ = fs::remove_file(&kernel_path).await;
-        }
+    if !force
+        && kernel_exists
+        && let Err(e) = verify_sha256(&kernel_path, HELLO_KERNEL_SHA256).await
+    {
+        tracing::warn!(error = %e, "cached hello kernel sha256 mismatch; re-downloading");
+        kernel_exists = false;
+        let _ = fs::remove_file(&kernel_path).await;
     }
 
-    if !force && rootfs_exists {
-        if let Err(e) = verify_sha256(&rootfs_path, HELLO_ROOTFS_SHA256).await {
-            tracing::warn!(error = %e, "cached hello rootfs sha256 mismatch; re-downloading");
-            rootfs_exists = false;
-            let _ = fs::remove_file(&rootfs_path).await;
-        }
+    if !force
+        && rootfs_exists
+        && let Err(e) = verify_sha256(&rootfs_path, HELLO_ROOTFS_SHA256).await
+    {
+        tracing::warn!(error = %e, "cached hello rootfs sha256 mismatch; re-downloading");
+        rootfs_exists = false;
+        let _ = fs::remove_file(&rootfs_path).await;
     }
 
     if !force && kernel_exists && rootfs_exists {
@@ -280,10 +282,17 @@ pub async fn run_task(cmd: String) -> Result<()> {
     let _ = cmd;
 
     // Fail fast with a clear message (we run unprivileged).
-    match fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").await {
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .await
+    {
         Ok(_) => {}
         Err(e) => {
-            bail!("/dev/kvm not accessible ({e}); try `peer-ci doctor` and ensure your user has permission (often via the kvm group)");
+            bail!(
+                "/dev/kvm not accessible ({e}); try `peer-ci doctor` and ensure your user has permission (often via the kvm group)"
+            );
         }
     }
 
@@ -313,9 +322,9 @@ pub async fn run_task(cmd: String) -> Result<()> {
 
     let jail_root = chroot_base.join(&id).join("root");
     let _ = fs::remove_dir_all(chroot_base.join(&id)).await;
-    fs::create_dir_all(&jail_root).await.with_context(|| {
-        format!("create jail root: {}", jail_root.display())
-    })?;
+    fs::create_dir_all(&jail_root)
+        .await
+        .with_context(|| format!("create jail root: {}", jail_root.display()))?;
 
     let kernel_jail = jail_root.join("hello-vmlinux.bin");
     let rootfs_jail = jail_root.join("hello-rootfs.ext4");
