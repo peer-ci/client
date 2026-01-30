@@ -15,10 +15,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
 
     runs-on: ${{ matrix.runner }}
 
@@ -26,36 +26,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Set target triple
+        shell: bash
+        run: echo "TARGET=${{ matrix.arch }}-unknown-linux-gnu" >> "$GITHUB_ENV"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
-          targets: ${{ matrix.target }}
 
       - name: Rust cache
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
 
-      - name: Install aarch64 cross linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
       - name: Build
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ env.TARGET }}
 
       - name: Strip
         shell: bash
         run: |
           set -euo pipefail
-          bin=target/${{ matrix.target }}/release/peer-ci
-          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
-            aarch64-linux-gnu-strip "$bin" || true
-          else
-            strip "$bin" || true
-          fi
+          bin=target/${{ env.TARGET }}/release/peer-ci
+          strip "$bin" || true
 
       - name: Package
         shell: bash
@@ -63,10 +54,10 @@ jobs:
           set -euo pipefail
           name=peer-ci
           version=${GITHUB_REF_NAME}
-          dist=${name}-${version}-${{ matrix.target }}
+          dist=${name}-${version}-${{ env.TARGET }}
 
           mkdir -p dist/${dist}
-          cp target/${{ matrix.target }}/release/${name} dist/${dist}/
+          cp target/${{ env.TARGET }}/release/${name} dist/${dist}/
 
           tar -C dist -czf dist/${dist}.tar.gz ${dist}
           sha256sum dist/${dist}.tar.gz > dist/${dist}.tar.gz.sha256
@@ -74,7 +65,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: peer-ci-${{ matrix.target }}
+          name: peer-ci-${{ env.TARGET }}
           path: dist/*
 
   publish:
