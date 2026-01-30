@@ -55,8 +55,8 @@ async fn run_command(cmd: Command) -> Result<()> {
                 println!("{}", guest.rootfs.display());
             }
         }
-        Command::Run { cmd } => {
-            firecracker::run_task(cmd).await?;
+        Command::Run { no_network, cmd } => {
+            firecracker::run_task(cmd, !no_network).await?;
         }
         Command::Doctor => unreachable!(),
     }

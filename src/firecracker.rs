@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 
@@ -276,10 +278,16 @@ pub async fn install_guest_hello(arch: Option<String>, force: bool) -> Result<In
     })
 }
 
-pub async fn run_task(cmd: String) -> Result<()> {
+pub async fn run_task(cmd: String, enable_network: bool) -> Result<()> {
     // Currently boots the cached hello guest and streams the serial console.
     // `cmd` is accepted for CLI compatibility but not used yet.
     let _ = cmd;
+
+    if enable_network {
+        check_tool("ip").await;
+        check_tool("iptables").await;
+        check_tool("sudo").await;
+    }
 
     // Fail fast with a clear message (we run unprivileged).
     match fs::OpenOptions::new()
@@ -379,22 +387,36 @@ pub async fn run_task(cmd: String) -> Result<()> {
     let jailer_pid = child.id().unwrap_or(0) as i32;
     let cleanup_dir = chroot_base.join(&id);
 
-    let cleanup = |pid: i32, dir: PathBuf| async move {
-        if pid != 0 {
-            let _ = tokio::process::Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .status()
-                .await;
-        }
-        let _ = fs::remove_dir_all(&dir).await;
-    };
-
     // Wait for API socket (unprivileged path/permissions issues will surface here).
     if let Err(e) = wait_for_socket_or_exit(&api_sock_host, &mut child).await {
-        cleanup(jailer_pid, cleanup_dir.clone()).await;
+        cleanup_all(jailer_pid, cleanup_dir.clone(), None).await;
         return Err(e);
     }
+
+    let net = if enable_network {
+        match setup_host_network(uid).await {
+            Ok(n) => Some(n),
+            Err(e) => {
+                cleanup_all(jailer_pid, cleanup_dir.clone(), None).await;
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+
+    let boot_args = if let Some(net) = net.as_ref() {
+        format!(
+            "console=ttyS0 reboot=k panic=1 {}",
+            net.kernel_ip_boot_arg()
+        )
+    } else {
+        "console=ttyS0 reboot=k panic=1".to_string()
+    };
+    let boot_json =
+        format!("{{\"kernel_image_path\":\"/hello-vmlinux.bin\",\"boot_args\":\"{boot_args}\"}}");
+
+    let net_json = net.as_ref().map(|n| n.firecracker_net_json());
 
     // Configure VM via Firecracker API.
     if let Err(e) = async {
@@ -404,35 +426,40 @@ pub async fn run_task(cmd: String) -> Result<()> {
             r#"{"vcpu_count":1,"mem_size_mib":256,"ht_enabled":false}"#,
         )
         .await?;
-        http_unix::put_json(
-            &api_sock_host,
-            "/boot-source",
-            "{\"kernel_image_path\":\"/hello-vmlinux.bin\",\"boot_args\":\"console=ttyS0 reboot=k panic=1\"}",
-        )
-        .await?;
+        http_unix::put_json(&api_sock_host, "/boot-source", &boot_json).await?;
         http_unix::put_json(
             &api_sock_host,
             "/drives/rootfs",
             "{\"drive_id\":\"rootfs\",\"path_on_host\":\"/hello-rootfs.ext4\",\"is_root_device\":true,\"is_read_only\":false}",
         )
         .await?;
+        if let Some(net_json) = net_json.as_deref() {
+            http_unix::put_json(&api_sock_host, "/network-interfaces/eth0", net_json).await?;
+        }
         http_unix::put_json(&api_sock_host, "/actions", r#"{"action_type":"InstanceStart"}"#).await?;
         Ok::<(), anyhow::Error>(())
     }
     .await
     {
-        cleanup(jailer_pid, cleanup_dir.clone()).await;
+        cleanup_all(jailer_pid, cleanup_dir.clone(), net).await;
         return Err(e);
     }
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            cleanup(jailer_pid, cleanup_dir).await;
-            Ok(())
-        }
-        status = child.wait() => {
-            let _ = fs::remove_dir_all(&cleanup_dir).await;
-            let status = status?;
+    enum Exit {
+        CtrlC,
+        Status(std::process::ExitStatus),
+    }
+
+    let exit = tokio::select! {
+        _ = tokio::signal::ctrl_c() => Exit::CtrlC,
+        status = child.wait() => Exit::Status(status?),
+    };
+
+    cleanup_all(jailer_pid, cleanup_dir, net).await;
+
+    match exit {
+        Exit::CtrlC => Ok(()),
+        Exit::Status(status) => {
             if status.success() {
                 Ok(())
             } else {
@@ -440,6 +467,370 @@ pub async fn run_task(cmd: String) -> Result<()> {
             }
         }
     }
+}
+
+struct HostNetwork {
+    tap: String,
+    tap_ip: String,
+    guest_ip: String,
+    mask: String,
+    out_iface: String,
+    ip_forward_was_enabled: bool,
+}
+
+impl HostNetwork {
+    fn kernel_ip_boot_arg(&self) -> String {
+        // ip=<client-ip>::<gw-ip>:<netmask>::<device>:off
+        format!(
+            "ip={}::{}:{}::eth0:off",
+            self.guest_ip, self.tap_ip, self.mask
+        )
+    }
+
+    fn firecracker_net_json(&self) -> String {
+        format!(
+            "{{\"iface_id\":\"eth0\",\"host_dev_name\":\"{}\"}}",
+            self.tap
+        )
+    }
+}
+
+async fn setup_host_network(uid: u32) -> Result<HostNetwork> {
+    let out_iface = detect_default_route_iface().await?;
+    let idx = allocate_tap_index().await?;
+    let tap = format!("peerci-tap{idx}");
+    let (tap_ip, guest_ip, mask) = compute_tap_guest_ips(idx);
+
+    let ip_forward = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        .await
+        .context("read /proc/sys/net/ipv4/ip_forward")?;
+    let ip_forward_was_enabled = ip_forward.trim() == "1";
+
+    let uid_s = uid.to_string();
+
+    let net = HostNetwork {
+        tap,
+        tap_ip,
+        guest_ip,
+        mask,
+        out_iface,
+        ip_forward_was_enabled,
+    };
+
+    if let Err(e) = async {
+        sudo_run(&[
+            "ip",
+            "tuntap",
+            "add",
+            net.tap.as_str(),
+            "mode",
+            "tap",
+            "user",
+            uid_s.as_str(),
+        ])
+        .await?;
+
+        let tap_cidr = format!("{}/30", net.tap_ip);
+        sudo_run(&[
+            "ip",
+            "addr",
+            "add",
+            tap_cidr.as_str(),
+            "dev",
+            net.tap.as_str(),
+        ])
+        .await?;
+        sudo_run(&["ip", "link", "set", net.tap.as_str(), "up"]).await?;
+
+        if !net.ip_forward_was_enabled {
+            sudo_run(&["sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward"]).await?;
+        }
+
+        ensure_iptables_rule(
+            &[
+                "iptables",
+                "-t",
+                "nat",
+                "-C",
+                "POSTROUTING",
+                "-o",
+                net.out_iface.as_str(),
+                "-s",
+                net.guest_ip.as_str(),
+                "-j",
+                "MASQUERADE",
+            ],
+            &[
+                "iptables",
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-o",
+                net.out_iface.as_str(),
+                "-s",
+                net.guest_ip.as_str(),
+                "-j",
+                "MASQUERADE",
+            ],
+        )
+        .await?;
+
+        ensure_iptables_rule(
+            &[
+                "iptables",
+                "-C",
+                "FORWARD",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ],
+            &[
+                "iptables",
+                "-A",
+                "FORWARD",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ],
+        )
+        .await?;
+
+        ensure_iptables_rule(
+            &[
+                "iptables",
+                "-C",
+                "FORWARD",
+                "-i",
+                net.tap.as_str(),
+                "-o",
+                net.out_iface.as_str(),
+                "-j",
+                "ACCEPT",
+            ],
+            &[
+                "iptables",
+                "-A",
+                "FORWARD",
+                "-i",
+                net.tap.as_str(),
+                "-o",
+                net.out_iface.as_str(),
+                "-j",
+                "ACCEPT",
+            ],
+        )
+        .await?;
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await
+    {
+        cleanup_host_network(net).await;
+        return Err(e);
+    }
+
+    Ok(net)
+}
+
+async fn cleanup_all(pid: i32, dir: PathBuf, net: Option<HostNetwork>) {
+    if pid > 0 {
+        let pid_s = pid.to_string();
+        let _ = tokio::process::Command::new("kill")
+            .args(["-TERM", pid_s.as_str()])
+            .status()
+            .await;
+        let _ = tokio::process::Command::new("kill")
+            .args(["-KILL", pid_s.as_str()])
+            .status()
+            .await;
+    }
+
+    if let Some(net) = net {
+        cleanup_host_network(net).await;
+    }
+
+    let _ = fs::remove_dir_all(&dir).await;
+}
+
+async fn detect_default_route_iface() -> Result<String> {
+    let out = tokio::process::Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .await
+        .context("run `ip route show default`")?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let mut it = line.split_whitespace();
+        while let Some(tok) = it.next() {
+            if tok == "dev"
+                && let Some(iface) = it.next()
+            {
+                return Ok(iface.to_string());
+            }
+        }
+    }
+
+    bail!("unable to detect default route interface (no `dev` in `ip route show default`)")
+}
+
+async fn allocate_tap_index() -> Result<u32> {
+    let out = tokio::process::Command::new("ip")
+        .args(["link", "show"])
+        .output()
+        .await
+        .context("run `ip link show`")?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut used = HashSet::new();
+    for line in stdout.lines() {
+        if let Some((_, rest)) = line.split_once(": ")
+            && let Some((name, _)) = rest.split_once(':')
+            && let Some(idx_str) = name.trim().strip_prefix("peerci-tap")
+            && let Ok(idx) = idx_str.parse::<u32>()
+        {
+            used.insert(idx);
+        }
+    }
+
+    for i in 0u32..16384 {
+        if !used.contains(&i) {
+            return Ok(i);
+        }
+    }
+
+    bail!("unable to allocate tap index (peerci-tap0..peerci-tap16383 all taken)")
+}
+
+fn compute_tap_guest_ips(idx: u32) -> (String, String, String) {
+    let tap_host = idx * 4 + 1;
+    let guest_host = tap_host + 1;
+
+    let tap_ip = format!("172.16.{}.{}", tap_host / 256, tap_host % 256);
+    let guest_ip = format!("172.16.{}.{}", guest_host / 256, guest_host % 256);
+    let mask = "255.255.255.252".to_string();
+
+    (tap_ip, guest_ip, mask)
+}
+
+async fn sudo_run(args: &[&str]) -> Result<()> {
+    let status = tokio::process::Command::new("sudo")
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .context("spawn sudo")?;
+
+    if !status.success() {
+        bail!("sudo command failed: {status}");
+    }
+
+    Ok(())
+}
+
+async fn sudo_status(args: &[&str]) -> Result<std::process::ExitStatus> {
+    tokio::process::Command::new("sudo")
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .context("spawn sudo")
+}
+
+async fn ensure_iptables_rule(check: &[&str], add: &[&str]) -> Result<()> {
+    let status = sudo_status(check).await?;
+    if !status.success() {
+        sudo_run(add).await?;
+    }
+    Ok(())
+}
+
+async fn cleanup_host_network(net: HostNetwork) {
+    let _ = sudo_run(&[
+        "iptables",
+        "-t",
+        "nat",
+        "-D",
+        "POSTROUTING",
+        "-o",
+        net.out_iface.as_str(),
+        "-s",
+        net.guest_ip.as_str(),
+        "-j",
+        "MASQUERADE",
+    ])
+    .await;
+
+    let _ = sudo_run(&[
+        "iptables",
+        "-D",
+        "FORWARD",
+        "-i",
+        net.tap.as_str(),
+        "-o",
+        net.out_iface.as_str(),
+        "-j",
+        "ACCEPT",
+    ])
+    .await;
+
+    let _ = sudo_run(&["ip", "link", "del", net.tap.as_str()]).await;
+
+    match any_peerci_taps_exist().await {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = sudo_run(&[
+                "iptables",
+                "-D",
+                "FORWARD",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ])
+            .await;
+
+            if !net.ip_forward_was_enabled {
+                let _ = sudo_run(&["sh", "-c", "echo 0 > /proc/sys/net/ipv4/ip_forward"]).await;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cleanup: unable to check for peerci taps");
+        }
+    }
+}
+
+async fn any_peerci_taps_exist() -> Result<bool> {
+    let out = tokio::process::Command::new("ip")
+        .args(["link", "show"])
+        .output()
+        .await
+        .context("run `ip link show`")?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        if let Some((_, rest)) = line.split_once(": ")
+            && let Some((name, _)) = rest.split_once(':')
+            && name.trim().starts_with("peerci-tap")
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn default_chroot_base() -> PathBuf {

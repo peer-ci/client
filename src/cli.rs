@@ -41,6 +41,10 @@ pub enum Command {
 
     /// Boot the hello guest in a Firecracker microVM and stream the serial console.
     Run {
+        /// Disable host networking setup + VM network device configuration.
+        #[arg(long)]
+        no_network: bool,
+
         /// Shell command to execute inside the VM (currently unused; boots hello guest only).
         #[arg(long)]
         cmd: String,
