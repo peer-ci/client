@@ -12,6 +12,14 @@ const PINNED_SHA256_X86_64: &str =
 const PINNED_SHA256_AARCH64: &str =
     "65a39256b9dd741e20c3a3fe5055cb38e5159049b5ede2015604951521000a04";
 
+const HELLO_KERNEL_URL: &str = "https://s3.amazonaws.com/spec.ccfc.min/img/hello/kernel/hello-vmlinux.bin";
+const HELLO_ROOTFS_URL: &str = "https://s3.amazonaws.com/spec.ccfc.min/img/hello/fsfiles/hello-rootfs.ext4";
+
+const HELLO_KERNEL_SHA256: &str =
+    "882fa465c43ab7d92e31bd4167da3ad6a82cb9230f9b0016176df597c6014cef";
+const HELLO_ROOTFS_SHA256: &str =
+    "786f0612582cadcee4c8ad46e30e4cc93dff9a3c0b4ede3f3c597b4c241dd547";
+
 pub async fn doctor() -> Result<bool> {
     println!("peer-ci doctor");
 
@@ -74,6 +82,25 @@ pub async fn doctor() -> Result<bool> {
     required_failures += check_binary("firecracker", cache_dir.as_deref(), normalized_arch).await;
     required_failures += check_binary("jailer", cache_dir.as_deref(), normalized_arch).await;
 
+    // OPTIONAL: hello guest artifacts cached
+    if let Some(cache_dir) = cache_dir.as_deref() {
+        let guest_dir = hello_guest_dir(cache_dir, normalized_arch);
+        let kernel = guest_dir.join("hello-vmlinux.bin");
+        let rootfs = guest_dir.join("hello-rootfs.ext4");
+
+        if fs::try_exists(&kernel).await.unwrap_or(false) {
+            pass("guest-hello-kernel", &kernel.display().to_string());
+        } else {
+            warn("guest-hello-kernel", "not cached");
+        }
+
+        if fs::try_exists(&rootfs).await.unwrap_or(false) {
+            pass("guest-hello-rootfs", &rootfs.display().to_string());
+        } else {
+            warn("guest-hello-rootfs", "not cached");
+        }
+    }
+
     if required_failures == 0 {
         println!("Result: OK");
         Ok(true)
@@ -86,6 +113,11 @@ pub async fn doctor() -> Result<bool> {
 pub struct InstalledBinaries {
     pub firecracker: PathBuf,
     pub jailer: Option<PathBuf>,
+}
+
+pub struct InstalledGuest {
+    pub kernel: PathBuf,
+    pub rootfs: PathBuf,
 }
 
 pub async fn install_firecracker(
@@ -169,6 +201,79 @@ pub async fn install_firecracker(
     })
 }
 
+pub async fn install_guest_hello(arch: Option<String>, force: bool) -> Result<InstalledGuest> {
+    let arch_in = arch.unwrap_or_else(|| platform::current_arch().to_string());
+    let resolved_arch = match platform::normalize_arch(&arch_in) {
+        Ok(a) => a.to_string(),
+        Err(_) => {
+            tracing::warn!(arch = %arch_in, "unsupported arch; using as-is");
+            arch_in
+        }
+    };
+
+    let cache_dir = cache_dir()?;
+    let install_dir = hello_guest_dir(&cache_dir, &resolved_arch);
+    let kernel_path = install_dir.join("hello-vmlinux.bin");
+    let rootfs_path = install_dir.join("hello-rootfs.ext4");
+
+    let mut kernel_exists = fs::try_exists(&kernel_path).await.unwrap_or(false);
+    let mut rootfs_exists = fs::try_exists(&rootfs_path).await.unwrap_or(false);
+
+    if !force && kernel_exists {
+        if let Err(e) = verify_sha256(&kernel_path, HELLO_KERNEL_SHA256).await {
+            tracing::warn!(error = %e, "cached hello kernel sha256 mismatch; re-downloading");
+            kernel_exists = false;
+            let _ = fs::remove_file(&kernel_path).await;
+        }
+    }
+
+    if !force && rootfs_exists {
+        if let Err(e) = verify_sha256(&rootfs_path, HELLO_ROOTFS_SHA256).await {
+            tracing::warn!(error = %e, "cached hello rootfs sha256 mismatch; re-downloading");
+            rootfs_exists = false;
+            let _ = fs::remove_file(&rootfs_path).await;
+        }
+    }
+
+    if !force && kernel_exists && rootfs_exists {
+        return Ok(InstalledGuest {
+            kernel: kernel_path,
+            rootfs: rootfs_path,
+        });
+    }
+
+    fs::create_dir_all(&install_dir)
+        .await
+        .with_context(|| format!("create cache dir: {}", install_dir.display()))?;
+
+    if force || !kernel_exists {
+        let tmp = install_dir.join("hello-vmlinux.bin.tmp");
+        download_to_path(HELLO_KERNEL_URL, &tmp).await?;
+        if let Err(e) = verify_sha256(&tmp, HELLO_KERNEL_SHA256).await {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        let _ = fs::remove_file(&kernel_path).await;
+        fs::rename(&tmp, &kernel_path).await?;
+    }
+
+    if force || !rootfs_exists {
+        let tmp = install_dir.join("hello-rootfs.ext4.tmp");
+        download_to_path(HELLO_ROOTFS_URL, &tmp).await?;
+        if let Err(e) = verify_sha256(&tmp, HELLO_ROOTFS_SHA256).await {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        let _ = fs::remove_file(&rootfs_path).await;
+        fs::rename(&tmp, &rootfs_path).await?;
+    }
+
+    Ok(InstalledGuest {
+        kernel: kernel_path,
+        rootfs: rootfs_path,
+    })
+}
+
 pub async fn run_task(cmd: String) -> Result<()> {
     // Stub: later this will spin up a microVM and run the command inside it.
     tracing::info!(%cmd, "run requested");
@@ -182,6 +287,10 @@ fn cache_dir() -> Result<PathBuf> {
 
     let home = std::env::var("HOME").context("HOME not set (needed to resolve cache dir)")?;
     Ok(PathBuf::from(home).join(".cache").join("peer-ci"))
+}
+
+fn hello_guest_dir(cache_dir: &Path, arch: &str) -> PathBuf {
+    cache_dir.join("guest").join("hello").join(arch)
 }
 
 fn pass(check: &str, msg: &str) {

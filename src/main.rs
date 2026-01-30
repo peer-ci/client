@@ -27,12 +27,18 @@ async fn main() -> Result<()> {
             arch,
             force,
             no_jailer,
+            no_guest,
         } => {
-            let paths =
-                firecracker::install_firecracker(version, sha256, arch, force, !no_jailer).await?;
-            println!("{}", paths.firecracker.display());
-            if let Some(jailer) = paths.jailer {
+            let fc = firecracker::install_firecracker(version, sha256, arch.clone(), force, !no_jailer).await?;
+            println!("{}", fc.firecracker.display());
+            if let Some(jailer) = fc.jailer {
                 println!("{}", jailer.display());
+            }
+
+            if !no_guest {
+                let guest = firecracker::install_guest_hello(arch, force).await?;
+                println!("{}", guest.kernel.display());
+                println!("{}", guest.rootfs.display());
             }
         }
         Command::Run { cmd } => {

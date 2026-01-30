@@ -33,6 +33,10 @@ pub enum Command {
         /// Do not install jailer (not recommended).
         #[arg(long)]
         no_jailer: bool,
+
+        /// Do not install guest kernel/rootfs (not recommended).
+        #[arg(long)]
+        no_guest: bool,
     },
 
     /// Run a task inside a Firecracker microVM (stub).
