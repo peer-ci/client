@@ -1,5 +1,6 @@
 mod cli;
 mod firecracker;
+mod platform;
 
 use anyhow::Result;
 use clap::Parser;
@@ -17,6 +18,15 @@ async fn main() -> Result<()> {
         Command::Doctor => {
             firecracker::doctor().await?;
             println!("ok");
+        }
+        Command::InstallFirecracker {
+            version,
+            sha256,
+            arch,
+            force,
+        } => {
+            let path = firecracker::install_firecracker(version, sha256, arch, force).await?;
+            println!("{}", path.display());
         }
         Command::Run { cmd } => {
             firecracker::run_task(cmd).await?;
