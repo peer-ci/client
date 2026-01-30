@@ -16,8 +16,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Doctor => {
-            firecracker::doctor().await?;
-            println!("ok");
+            let ok = firecracker::doctor().await?;
+            if !ok {
+                std::process::exit(1);
+            }
         }
         Command::InstallFirecracker {
             version,

@@ -12,9 +12,75 @@ const PINNED_SHA256_X86_64: &str =
 const PINNED_SHA256_AARCH64: &str =
     "65a39256b9dd741e20c3a3fe5055cb38e5159049b5ede2015604951521000a04";
 
-pub async fn doctor() -> Result<()> {
-    // Stub: later we can validate KVM availability, Firecracker binary, API socket perms, etc.
-    Ok(())
+pub async fn doctor() -> Result<bool> {
+    println!("peer-ci doctor");
+
+    let mut required_failures = 0usize;
+
+    // REQUIRED: Linux
+    if std::env::consts::OS == "linux" {
+        pass("os", "linux");
+    } else {
+        fail(
+            "os",
+            &format!("expected linux, got {}", std::env::consts::OS),
+        );
+        required_failures += 1;
+    }
+
+    // REQUIRED: /dev/kvm exists and is readable+writable
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .await
+    {
+        Ok(_) => pass("kvm", "/dev/kvm is readable+writable"),
+        Err(e) => {
+            fail("kvm", &format!("/dev/kvm not accessible: {e}"));
+            required_failures += 1;
+        }
+    }
+
+    // OPTIONAL: architecture
+    let arch = platform::current_arch();
+    let normalized_arch = match platform::normalize_arch(arch) {
+        Ok(a) => {
+            pass("arch", a);
+            a
+        }
+        Err(_) => {
+            warn(
+                "arch",
+                &format!("{arch} (expected x86_64 or aarch64)"),
+            );
+            arch
+        }
+    };
+
+    // OPTIONAL: tar/curl (installer uses them)
+    check_tool("curl").await;
+    check_tool("tar").await;
+
+    // REQUIRED: firecracker + jailer present either in cache or on PATH
+    let cache_dir = match cache_dir() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            warn("cache", &format!("unable to resolve cache dir: {e}"));
+            None
+        }
+    };
+
+    required_failures += check_binary("firecracker", cache_dir.as_deref(), normalized_arch).await;
+    required_failures += check_binary("jailer", cache_dir.as_deref(), normalized_arch).await;
+
+    if required_failures == 0 {
+        println!("Result: OK");
+        Ok(true)
+    } else {
+        eprintln!("Result: FAILED ({required_failures} required check(s) failed)");
+        Ok(false)
+    }
 }
 
 pub struct InstalledBinaries {
@@ -116,6 +182,126 @@ fn cache_dir() -> Result<PathBuf> {
 
     let home = std::env::var("HOME").context("HOME not set (needed to resolve cache dir)")?;
     Ok(PathBuf::from(home).join(".cache").join("peer-ci"))
+}
+
+fn pass(check: &str, msg: &str) {
+    println!("PASS {check}: {msg}");
+}
+
+fn warn(check: &str, msg: &str) {
+    println!("WARN {check}: {msg}");
+}
+
+fn fail(check: &str, msg: &str) {
+    eprintln!("FAIL {check}: {msg}");
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn which_all(cmd: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+
+    let Some(path) = std::env::var_os("PATH") else {
+        return out;
+    };
+
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(cmd);
+        if is_executable(&candidate) && !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+
+    out
+}
+
+async fn version_line(bin: &Path) -> Option<String> {
+    let out = tokio::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .await
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut s = stdout.lines().chain(stderr.lines()).map(str::trim);
+    s.find(|l| !l.is_empty()).map(|l| l.to_string())
+}
+
+async fn check_tool(cmd: &str) {
+    let paths = which_all(cmd);
+    if paths.is_empty() {
+        warn(cmd, "not found on PATH");
+        return;
+    }
+
+    for p in paths {
+        let ver = version_line(&p).await;
+        if let Some(ver) = ver {
+            pass(cmd, &format!("{} ({ver})", p.display()));
+        } else {
+            pass(cmd, &p.display().to_string());
+        }
+    }
+}
+
+async fn check_binary(bin: &str, cache_dir: Option<&Path>, arch: &str) -> usize {
+    let mut found = Vec::new();
+
+    if let Some(cache_dir) = cache_dir {
+        let root = cache_dir.join("firecracker");
+        if let Ok(mut versions) = fs::read_dir(&root).await {
+            while let Ok(Some(entry)) = versions.next_entry().await {
+                let version_dir = entry.path();
+                let candidate = version_dir.join(arch).join(bin);
+                if fs::try_exists(&candidate).await.unwrap_or(false)
+                    && is_executable(&candidate)
+                    && !found.iter().any(|(_, p): &(String, PathBuf)| p == &candidate)
+                {
+                    found.push(("cache".to_string(), candidate));
+                }
+            }
+        }
+    }
+
+    for p in which_all(bin) {
+        found.push(("PATH".to_string(), p));
+    }
+
+    if found.is_empty() {
+        fail(bin, "not found in cache or on PATH");
+        return 1;
+    }
+
+    for (src, p) in found {
+        let ver = version_line(&p).await;
+        let msg = if let Some(ver) = ver {
+            format!("{src}: {} ({ver})", p.display())
+        } else {
+            format!("{src}: {}", p.display())
+        };
+        pass(bin, &msg);
+    }
+
+    0
 }
 
 async fn download_to_path(url: &str, dest: &Path) -> Result<()> {
