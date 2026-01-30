@@ -67,7 +67,7 @@ jobs:
           tar -C dist -czf dist/${dist}.tar.gz ${dist}
           sha256sum dist/${dist}.tar.gz > dist/${dist}.tar.gz.sha256
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: peer-ci-${{ matrix.target }}
           path: dist/*
